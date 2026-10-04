@@ -1,9 +1,10 @@
 # язык: Python 3.11+, файл: bot.py
-# pip install aiogram
+# pip install aiogram flask
 # запуск: python bot.py
 
-import asyncio, sqlite3, logging
+import asyncio, sqlite3, logging, threading, os
 from datetime import datetime, timezone
+from flask import Flask
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import (Message, CallbackQuery,
@@ -20,18 +21,21 @@ DB          = "exchange.db"
 
 logging.basicConfig(level=logging.INFO)
 
-RATES = {
-    "KZT": 520.0,
-    "RUB": 95.0,
-    "UAH": 42.0,
-    "USD": 1.0,
-}
+RATES = {"KZT": 520.0, "RUB": 95.0, "UAH": 42.0, "USD": 1.0}
 
-class Steps(StatesGroup):
-    choose_currency = State()
-    amount          = State()
-    paying          = State()
+# ---------- ВЕБ-СЕРВЕР (для Render) ----------
+web = Flask(__name__)
 
+@web.route("/")
+@web.route("/health")
+def health():
+    return "OK", 200
+
+def run_web():
+    web.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")),
+            use_reloader=False)
+
+# ---------- БД ----------
 def db_init():
     con = sqlite3.connect(DB)
     con.execute("""CREATE TABLE IF NOT EXISTS orders(
@@ -47,6 +51,12 @@ def db_add(tg_id, username, currency, amount, usdt):
         (tg_id, username, currency, amount, usdt, "created",
          datetime.now(timezone.utc).isoformat()))
     oid = cur.lastrowid; con.commit(); con.close(); return oid
+
+# ---------- БОТ ----------
+class Steps(StatesGroup):
+    choose_currency = State()
+    amount          = State()
+    paying          = State()
 
 router = Router()
 
@@ -89,10 +99,8 @@ async def choose_currency(c: CallbackQuery, state: FSMContext):
     rate = RATES.get(currency, 1.0)
     await state.update_data(currency=currency, rate=rate)
     await state.set_state(Steps.amount)
-    
     symbols = {"KZT": "₸", "RUB": "₽", "UAH": "₴", "USD": "$"}
     sym = symbols.get(currency, "")
-    
     await c.message.answer(
         f"💰 Валюта: <b>{currency}</b>\n"
         f"Курс: <b>1 USDT = {rate} {sym}</b>\n\n"
@@ -105,23 +113,17 @@ async def get_amount(m: Message, state: FSMContext):
     data = await state.get_data()
     currency = data.get("currency", "USD")
     rate = data.get("rate", 1.0)
-    
     try:
         amount = float(m.text.strip().replace(",", ".").replace(" ", ""))
         if amount <= 0: raise ValueError
     except:
-        await m.answer("Введи число. Например: 50000");
-        return
-    
+        await m.answer("Введи число. Например: 50000"); return
     usdt = round(amount / rate, 2)
-    
     if usdt < 1:
-        await m.answer(f"Минимум: 1 USDT (~{int(rate)} {currency}). Попробуй больше.")
+        await m.answer(f"Минимум: 1 USDT (~{int(rate)} {currency}).")
         return
-    
     oid = db_add(m.from_user.id, m.from_user.username or "",
                  currency, amount, usdt)
-    
     if OPERATOR_ID:
         try:
             await m.bot.send_message(OPERATOR_ID,
@@ -130,7 +132,6 @@ async def get_amount(m: Message, state: FSMContext):
                 f"сумма: {amount} {currency}\n"
                 f"к оплате: {usdt} USDT")
         except: pass
-    
     await state.set_state(Steps.paying)
     await m.answer(
         f"📋 <b>Ордер #{oid}</b>\n\n"
@@ -140,45 +141,41 @@ async def get_amount(m: Message, state: FSMContext):
         f"💳 <b>USDT TRC20 адрес:</b>\n"
         f"<code>{TRC20_ADDR}</code>\n"
         f"━━━━━━━━━━━━━━━━━\n\n"
-        f"Отправь ровно <b>{usdt} USDT</b> на адрес и нажми «Я оплатил».\n\n"
+        f"Отправь ровно <b>{usdt} USDT</b> и нажми «Я оплатил».\n\n"
         f"⏱ Ордер действителен 30 минут.",
-        parse_mode="HTML",
-        reply_markup=kb_paid())
+        parse_mode="HTML", reply_markup=kb_paid())
 
 @router.callback_query(F.data == "paid")
 async def paid(c: CallbackQuery, state: FSMContext):
     await c.message.answer(
-        "⏳ <b>Проверка транзакции…</b>\n\n"
-        "Пожалуйста, подождите 1–2 минуты.",
+        "⏳ <b>Проверка транзакции…</b>\n\nПодождите 1–2 минуты.",
         parse_mode="HTML")
-    
     await asyncio.sleep(5)
-    
     await c.message.answer(
         "❌ <b>Ошибка обработки</b>\n\n"
         "Транзакция не подтверждена.\n\n"
-        "Возможные причины:\n"
-        "• Неверная сумма перевода\n"
-        "• Токен отправлен в другой сети (нужна TRC20)\n"
+        "Причины:\n"
+        "• Неверная сумма\n"
+        "• Токен в другой сети (нужна TRC20)\n"
         "• Задержка сети TRON\n\n"
-        "Проверьте детали и повторите, или напишите в поддержку: @твой_саппорт",
+        "Свяжитесь с поддержкой: @твой_саппорт",
         parse_mode="HTML")
-    
     if OPERATOR_ID:
         try:
             await c.bot.send_message(OPERATOR_ID,
                 f"💸 {c.from_user.username} нажал «Я оплатил»")
         except: pass
-    
     await state.clear()
     await c.answer()
 
-async def main():
-    db_init()
+# ---------- ЗАПУСК ----------
+async def run_bot():
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    db_init()
+    threading.Thread(target=run_web, daemon=True).start()
+    asyncio.run(run_bot())
